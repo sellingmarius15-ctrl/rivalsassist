@@ -1,4 +1,5 @@
 import ctypes, os, sys, time, threading, traceback, math, random, json, struct
+from ctypes import wintypes
 from dataclasses import dataclass, field, asdict
 
 try:
@@ -8,8 +9,8 @@ except Exception:
 
 import numpy as np
 import cv2
-from PyQt5.QtCore import Qt, QTimer, QPoint
-from PyQt5.QtGui import QPainter, QPen, QColor, QFont
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QPainter, QPen, QColor
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QCheckBox, QSlider, QPushButton, QFrame)
 
@@ -30,21 +31,22 @@ CONFIG_PATH = os.path.join(_base(), "config.json")
 class Config:
     monitor: int = 1
     region: list | None = None
-    fps: int = 120
+    fps: int = 60
     mode: str = "auto"
     model: str = "models/rivals.pt"
     conf: float = 0.35
     imgsz: int = 640
     device: str = "0"
-    color_ranges: list = field(default_factory=lambda: [
-        [0, 130, 90, 12, 255, 255],
-        [168, 130, 90, 180, 255, 255],
-    ])
+    color_ranges: list = field(default_factory=list)
+    ignore_ranges: list = field(default_factory=list)
     min_area: int = 90
     max_area: int = 400000
+    min_aspect: float = 1.3
+    detect_scale: float = 0.5
+    detect_fps: int = 60
     aim_enabled: bool = True
     aim_key: int = 0x05
-    fov: int = 220
+    fov: int = 200
     smoothing: float = 0.28
     max_step: float = 60.0
     prediction: float = 0.0
@@ -169,7 +171,8 @@ class Capture:
         try:
             import dxcam
             self._cam = dxcam.create(output_idx=cfg.monitor - 1,
-                                     region=(l, t, l + w, t + h))
+                                     region=(l, t, l + w, t + h),
+                                     target_fps=cfg.detect_fps)
             self._cam.grab()
             self.backend = "dxcam"
             return
@@ -226,24 +229,36 @@ class Detector:
                                    verbose=False)[0]
             return [Detection(*b.xyxy[0].tolist(), float(b.conf[0]))
                     for b in r.boxes]
-        hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
+
+        sc = self.cfg.detect_scale
+        small = cv2.resize(frame, None, fx=sc, fy=sc,
+                           interpolation=cv2.INTER_NEAREST)
+        hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
         mask = None
         for h1, s1, v1, h2, s2, v2 in self.cfg.color_ranges:
             m = cv2.inRange(hsv, (h1, s1, v1), (h2, s2, v2))
             mask = m if mask is None else cv2.bitwise_or(mask, m)
-        k = np.ones((3, 3), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+        if mask is None:
+            return []
+        for h1, s1, v1, h2, s2, v2 in self.cfg.ignore_ranges:
+            m = cv2.inRange(hsv, (h1, s1, v1), (h2, s2, v2))
+            mask = cv2.bitwise_and(mask, cv2.bitwise_not(m))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+
         out = []
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
                                        cv2.CHAIN_APPROX_SIMPLE)
+        inv = 1.0 / sc
+        amin, amax = self.cfg.min_area * sc * sc, self.cfg.max_area * sc * sc
         for c in contours:
             x, y, w, h = cv2.boundingRect(c)
-            if not (self.cfg.min_area <= w * h <= self.cfg.max_area):
+            if not (amin <= w * h <= amax):
                 continue
             if h <= 2 or w <= 2:
                 continue
-            out.append(Detection(x, y, x + w, y + h))
+            if h < w * self.cfg.min_aspect:
+                continue
+            out.append(Detection(x * inv, y * inv, (x + w) * inv, (y + h) * inv))
         return out
 
 
@@ -366,9 +381,8 @@ class MemESP:
             return None
 
     def positions(self):
-        ws = self._find(self.dm, "Workspace")
         pl = self._find(self.dm, "Players")
-        if not ws or not pl:
+        if not pl:
             return []
         out = []
         for p in self._kids(pl):
@@ -415,7 +429,7 @@ class Overlay(QWidget):
         self.setGeometry(*region)
         t = QTimer(self)
         t.timeout.connect(self.update)
-        t.start(16)
+        t.start(50)
 
     def paintEvent(self, _):
         s = self.shared
@@ -468,6 +482,7 @@ class Panel(QWidget):
         self.setStyleSheet(CSS)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setWindowTitle("RivalsAssist")
         self.setFixedWidth(232)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(10, 8, 10, 10)
@@ -608,7 +623,7 @@ def main():
     panel.move(cap.region[0] + 24, cap.region[1] + 24)
     panel.show()
 
-    prev, keys, last = {}, {}, [0.0]
+    prev, keys, last, last_status = {}, {}, [0.0], [0.0]
 
     def edge(vk):
         now = key_down(vk)
@@ -669,15 +684,40 @@ def main():
                 shared["fov"] = cfg.fov if cfg.overlay else 0
                 shared["show_boxes"] = cfg.overlay
 
-                focused = (not cfg.require_focus) or \
-                          (cfg.window_title.lower() in fg_title().lower())
+                title = fg_title().lower()
+                real = cfg.window_title.lower() in title
+                focused = (not cfg.require_focus) or real or ("rivalsassist" in title)
+
+                s_en, s_ig, s_rst = edge(0x76), edge(0x75), edge(0x74)
+                if s_rst:
+                    cfg.color_ranges, cfg.ignore_ranges = [], []
+                    save_cfg(cfg)
+                    panel.status.setText("HSV reset")
+                if s_en or s_ig:
+                    pt = wintypes.POINT()
+                    user32.GetCursorPos(ctypes.byref(pt))
+                    px_, py_ = pt.x - ox, pt.y - oy
+                    if 0 <= px_ < w and 0 <= py_ < h:
+                        b_, g_, r_ = frame[py_, px_]
+                        hv = cv2.cvtColor(np.uint8([[[r_, g_, b_]]]),
+                                          cv2.COLOR_RGB2HSV)[0][0]
+                        hh_, ss_, vv_ = int(hv[0]), int(hv[1]), int(hv[2])
+                        rng = [max(0, hh_ - 8), max(0, ss_ - 70), max(0, vv_ - 80),
+                               min(179, hh_ + 8), 255, 255]
+                        if s_ig:
+                            cfg.ignore_ranges.append(rng)
+                            panel.status.setText(f"IGNORE h{hh_} s{ss_} v{vv_}")
+                        else:
+                            cfg.color_ranges.append(rng)
+                            panel.status.setText(f"ENEMY h{hh_} s{ss_} v{vv_}")
+                        save_cfg(cfg)
 
                 if focused:
                     if cfg.aim_enabled and key_down(cfg.aim_key):
                         dx, dy = aim_step(dets, cx, cy, cfg, prev)
                         if dx or dy:
                             mouse_move(dx, dy)
-                    if cfg.trigger_enabled and key_down(cfg.trigger_key) \
+                    if real and cfg.trigger_enabled and key_down(cfg.trigger_key) \
                             and not key_down(0x01) \
                             and time.perf_counter() - last[0] > 0.06:
                         if pick_target(dets, cx, cy, cfg.trigger_fov, 0.5):
@@ -687,9 +727,10 @@ def main():
                             left_up()
                             last[0] = time.perf_counter()
 
-                panel.status.setText(f"{det.kind}{'+mem' if mem[0] else ''} "
-                                     f"det:{len(dets)} "
-                                     f"{'OK' if focused else 'UNFOCUSED'}")
+                if time.perf_counter() - last_status[0] > 0.25:
+                    panel.status.setText(f"{det.kind} det:{len(dets)} "
+                                         f"{'OK' if real else 'PANEL'}")
+                    last_status[0] = time.perf_counter()
             except Exception:
                 panel.status.setText("err: " + traceback.format_exc(limit=1).splitlines()[-1])
                 time.sleep(0.2)
